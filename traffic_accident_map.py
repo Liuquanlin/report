@@ -2,141 +2,347 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
+# 這裡原本想用 google map api，但要錢就算了，改用免費的 geopy
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
-import random
+import math
+import requests
+import polyline
+import os
+# 這兩個是用來做地圖圖例的，網路上找的範例
+from branca.element import Template, MacroElement
 
-# --- 1. 頁面設定 ---
-st.set_page_config(page_title="台中市車禍熱點地圖", layout="wide")
-st.title("🚗 台中市交通事故熱點導航")
-st.markdown("輸入起點與終點，系統將標示路徑周邊的**高風險車禍路段**。")
+# 老師說過要處理例外狀況，所以先檢查有沒有裝 shapely 這個套件
+# 如果沒裝就不能用進階的幾何運算，只能用簡單的算法
+try:
+    from shapely.geometry import LineString, Point
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    # 沒裝就算了，設個 flag 記起來
+    SHAPELY_AVAILABLE = False
 
-# --- 2. 模擬資料生成 (正式版請替換為讀取 CSV) ---
+# 把資料讀取功能獨立出來，還有加上 cache 這樣才不會每次按按鈕都要重跑一次
 @st.cache_data
-def load_data():
-    # 這裡模擬一些台中市區的座標
-    data = []
-    # 修正：加上註解符號 # 避免語法錯誤
-    base_lat, base_lon = 24.1477, 120.6733 # (台中車站附近)
+def load_taichung_open_data():
+    """
+    這邊是處理資料讀取的地方。
+    原本打算直接讀 CSV，但發現公開資料格式有點亂，而且有些月份缺經緯度。
+    所以後來決定把整理好的資料直接寫在 code 裡面當作 fallback，比較穩。
+    """
     
-    for _ in range(100):
-        lat = base_lat + random.uniform(-0.05, 0.05)
-        lon = base_lon + random.uniform(-0.05, 0.05)
-        count = random.choices([1, 3, 6], weights=[0.5, 0.3, 0.2])[0] # 模擬事故次數
+    # 這是原本 CSV 的路徑，但我後來都用下面的 list 了，這個當作參考
+    csv_path = "traffic_accidents.csv" 
+    
+    # 把之前辛苦整理好的 113-114 年熱門路口資料全部貼過來
+    # 包含經緯度、事故件數、風險等級等等
+    # 雖然有點長，但這樣最保險，不會因為少檔案就掛掉
+    fallback_data = [
+        # --- 113年 & 114年 熱門事故路口 (已格式化) ---
+        {'lat': 24.152033, 'lon': 120.683056, 'count': 12, 'color': 'red', 'risk': '高危險 (件數:12), (北區)三民路與崇德路口'},
+        {'lat': 24.163026, 'lon': 120.645084, 'count': 20, 'color': 'red', 'risk': '高危險 (件數:20), (西屯區)文心路與臺灣大道口'},
+        {'lat': 24.128038, 'lon': 120.661025, 'count': 11, 'color': 'red', 'risk': '高危險 (件數:11), (南區)文心南路與建國北路口'},
+        {'lat': 24.148055, 'lon': 120.674011, 'count': 15, 'color': 'red', 'risk': '高危險 (件數:15), (西屯區)臺灣大道與惠中路口'},
+        {'lat': 24.142011, 'lon': 120.638055, 'count': 17, 'color': 'red', 'risk': '高危險 (件數:17), (南屯區)五權西路與環中路口'},
+        {'lat': 24.168022, 'lon': 120.635088, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (西屯區)安和路與臺灣大道口'},
+        {'lat': 24.136845, 'lon': 120.685022, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (東區)振興路與環中東路口'},
+        {'lat': 24.195022, 'lon': 120.675011, 'count': 13, 'color': 'red', 'risk': '高危險 (件數:13), (北屯區)環中路與崇德路口'},
+        {'lat': 24.111234, 'lon': 120.655432, 'count': 11, 'color': 'red', 'risk': '高危險 (件數:11), (南區)忠明南路與國光路口'},
+        {'lat': 24.105022, 'lon': 120.690011, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (大里區)德芳南路與環中東路口'},
+        {'lat': 24.178822, 'lon': 120.646544, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)福科路與環中路口'},
+        {'lat': 24.155018, 'lon': 120.663088, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西區)臺灣大道與民權路口'},
+        {'lat': 24.120055, 'lon': 120.660088, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (南區)復興路與南平路口'},
+        {'lat': 24.185033, 'lon': 120.605044, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (沙鹿區)臺灣大道與正英路口'},
+        {'lat': 24.205011, 'lon': 120.705044, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)松竹路與旱溪東路口'},
         
-        # 定義顏色
-        if count >= 5:
-            color = 'red'
-            risk = '高危險 (5次以上)'
-        elif count >= 2:
-            color = 'orange' # 用橘黃色代替黃色在地圖上較清楚
-            risk = '注意 (2-4次)'
-        else:
-            color = 'green'
-            risk = '曾經發生 (1次)'
-            
-        data.append([lat, lon, count, color, risk])
+        # --- 以下為從 114 年新檔案中整理出的路口 (這裡超麻煩，因為原始資料沒座標) ---
+        # 這些 0.0 的部分，等一下程式執行時會自動用 API 去查
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西屯區)環中路與市政路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)松竹路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (南區)美村南路與忠明南路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (沙鹿區)三民路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 13, 'color': 'red', 'risk': '高危險 (件數:13), (南屯區)環中路與向上路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 13, 'color': 'red', 'risk': '高危險 (件數:13), (西屯區)西屯路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 12, 'color': 'red', 'risk': '高危險 (件數:12), (南屯區)向上路與五權西路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (北屯區)崇德路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (南屯區)向上路與忠勇路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (南區)忠明南路與南屯路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (南屯區)五權西路與向上路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (南區)美村南路與高工路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)臺灣大道與河南路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)朝富路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與國際街口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)東大路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)崇德十路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)福科路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北區)太原路與崇德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)環中東路與太原路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (烏日區)站區一路與高鐵五路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)漢陽街與武漢街口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)梅川東路與太原路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (太平區)環中東路與中山路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西區)五權路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 11, 'color': 'red', 'risk': '高危險 (件數:11), (西屯區)河南路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西屯區)中清路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)太原路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)昌平路與北屯路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)中科路與廣福路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (北區)健行路與學士路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)崇德路與文心路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (太平區)市民大道與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)崇德路與松竹路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)中清聯絡道與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (大里區)仁化路與至善路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與筏堤西街口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)惠中路與市政北七路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西區)民權路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (潭子區)中山路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西屯區)凱旋路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (烏日區)高鐵五路與高鐵東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)環中路與中清路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)黎明路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北區)中清路與五權路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)東大路與西屯路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 13, 'color': 'red', 'risk': '高危險 (件數:13), (北屯區)文心路與崇德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (北屯區)環中路與崇德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (西屯區)環中路與中清聯絡道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (西屯區)市政路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西區)五權路與民權路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (北屯區)環中東路與松竹路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)文心路與北屯路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)黎明路與朝馬二街口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)櫻花路與文心路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)環中路與朝馬路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (潭子區)福貴路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)中清路與漢口路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西屯區)環中路與西屯路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (南屯區)永春南路與忠勇路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北區)精武路與雙十路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (東區)進化路與精武路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (霧峰區)峰堤路與錦州路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北區)學士路與進化北路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)經貿一路與中清路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與福林路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 11, 'color': 'red', 'risk': '高危險 (件數:11), (南區)忠明南路與國光路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 10, 'color': 'red', 'risk': '高危險 (件數:10), (大里區)德芳南路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (西屯區)朝馬路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (南區)五權南路與忠明南路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北屯區)太原路與旱溪東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)軍功路與太原路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (大里區)新仁路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (太平區)中山路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)環中路與福科路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)太原路與梅川東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西區)三民路與五權路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西區)公益路與美村路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西屯區)臺灣大道與東興路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西屯區)青海路與文心路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西屯區)惠來路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (西屯區)市政路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與工業區一路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)西屯路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (西屯區)臺灣大道與福林路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (潭子區)福貴路與環中東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)學士路與五權路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (外埔區)三環路與甲后路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (西屯區)惠中路與臺灣大道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (北屯區)環中東路與松竹路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (東區)自由路與進德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (烏日區)站區一路與高鐵五路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北屯區)崇德路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (大里區)仁愛路與成功二路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (北屯區)昌平路與環中路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (北屯區)崇德路與松竹路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 5, 'color': 'orange', 'risk': '中風險 (件數:5), (北屯區)南京東路與太原路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 9, 'color': 'orange', 'risk': '中風險 (件數:9), (北屯區)文心路與崇德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (烏日區)中山路與高鐵東路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (北區)太原路與崇德路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 8, 'color': 'orange', 'risk': '中風險 (件數:8), (南區)忠明南路與國光路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與文心路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)臺灣大道與安和路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)環中路與福科路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (西屯區)環中路與中清聯絡道口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 7, 'color': 'orange', 'risk': '中風險 (件數:7), (北屯區)環中東路與太原路口'}, 
+        {'lat': 0.0, 'lon': 0.0, 'count': 6, 'color': 'orange', 'risk': '中風險 (件數:6), (北區)三民路與錦新街口'}, 
+    ]
     
-    df = pd.DataFrame(data, columns=['lat', 'lon', 'count', 'color', 'risk'])
+    # 建立 DataFrame 方便後續處理
+    df = pd.DataFrame(fallback_data)
+
+    # --- 這裡開始是關鍵的自動補座標邏輯 ---
+    # 如果資料裡有 lat = 0.0 的，就代表需要用 API 去查
+    if (df['lat'] == 0.0).any():
+        # 顯示進度條讓使用者知道程式沒當掉
+        progress_text = "正在努力幫您查詢路口座標 (使用 OpenStreetMap)..."
+        my_bar = st.progress(0, text=progress_text)
+        
+        # 設定 user_agent 避免被 API 封鎖
+        geolocator = Nominatim(user_agent="taichung_traffic_fixer_v4")
+        
+        # 找出所有缺座標的資料索引
+        missing_indices = df[df['lat'] == 0.0].index
+        total_missing = len(missing_indices)
+        
+        for i, idx in enumerate(missing_indices):
+            row = df.loc[idx]
+            # 從 risk 欄位裡把路口名稱抓出來，例如: "高危險 (件數:11), (南屯區)文心路與向上路口" -> "(南屯區)文心路與向上路口"
+            try:
+                addr_part = row['risk'].split(', ')[-1]
+                # 清理一下地址，把括號拿掉比較好查
+                clean_addr = addr_part.replace('(', '').replace(')', '').replace('臺中市', '').replace('台中市', '')
+                
+                # 簡單移除行政區名，直接查路口通常比較準
+                for dist in ['中區', '東區', '南區', '西區', '北區', '北屯區', '西屯區', '南屯區', '太平區', '大里區', '霧峰區', '烏日區', '豐原區', '沙鹿區', '潭子區', '大雅區']:
+                    clean_addr = clean_addr.replace(dist, '')
+                
+                # 加上縣市名稱去查
+                query = f"台中市 {clean_addr}"
+                
+                # 呼叫 geopy 查詢
+                loc = geolocator.geocode(query, timeout=2)
+                if loc:
+                    # 查到了！趕快填進去
+                    df.at[idx, 'lat'] = loc.latitude
+                    df.at[idx, 'lon'] = loc.longitude
+            except:
+                # 查不到就算了，跳過
+                pass 
+            
+            # 更新進度條
+            my_bar.progress(int((i + 1) / total_missing * 100), text=f"正在定位: {clean_addr} ({i+1}/{total_missing})")
+            
+        my_bar.empty() # 跑完就把進度條藏起來
+        
+        # 最後把還是查不到座標的點拿掉，不然會顯示在海裡 (0,0)
+        df = df[df['lat'] != 0.0]
+        
     return df
 
-df_accidents = load_data()
+@st.cache_data
+def get_osrm_route(start, end):
+    # 用 OSRM 的免費 API 算路徑
+    url = f"http://router.project-osrm.org/route/v1/driving/{start[1]},{start[0]};{end[1]},{end[0]}"
+    try:
+        r = requests.get(url, params={'overview': 'full', 'geometries': 'polyline'}, timeout=5)
+        if r.status_code == 200:
+            res = r.json()
+            if res['code'] == 'Ok':
+                route = res['routes'][0]
+                # polyline.decode 會把編碼過的字串變回經緯度 list
+                return polyline.decode(route['geometry']), route['distance'], route['duration']
+    except: pass
+    return [], 0, 0
 
-# --- 3. 側邊欄：使用者輸入 ---
+@st.cache_data
+def geocode_address(address):
+    # 這是給使用者輸入起終點用的，一樣是用 Nominatim
+    try:
+        loc = Nominatim(user_agent="tw_traffic_v2").geocode(f"台中市 {address}")
+        if loc: return loc.latitude, loc.longitude
+    except: pass
+    return None
+
+def meters_per_degree(lat):
+    # 計算經緯度換算成公尺的比例，簡單算一下就好
+    return 111320.0, 40075000.0 * math.cos(math.radians(lat)) / 360.0
+
+# ------------------------ UI (使用者介面) ------------------------
+st.set_page_config(page_title="台中市車禍熱點導航", layout="wide")
+st.title("🚗 台中市交通事故熱點導航")
+
+# State (狀態變數)
+# 這裡是用來記住使用者的搜尋結果，才不會按個按鈕畫面就清空
+if 'app_state' not in st.session_state:
+    st.session_state.app_state = {
+        'has_result': False, 'nearby_df': None, 'start_coords': None, 'end_coords': None,
+        'route_path': [], 'route_dist': 0, 'route_time': 0,
+        'start_name': "", 'end_name': "", 'buffer': 300,
+        'center': [24.1477, 120.6733], 'zoom': 13
+    }
+
+# 載入資料 (這行會觸發上面的 load_taichung_open_data)
+df_accidents = load_taichung_open_data()
+
 with st.sidebar:
     st.header("🗺️ 路徑規劃")
-    start_location = st.text_input("輸入起點", "台中火車站")
-    end_location = st.text_input("輸入終點", "逢甲大學")
-    
-    run_btn = st.button("查詢路徑與風險")
+    start_input = st.text_input("輸入起點📍", "台中火車站")
+    end_input = st.text_input("輸入終點🏁", "逢甲大學")
+    buffer_input = st.slider("路徑緩衝距離", 50, 1000, 300, 50)
+    run_query = st.button("規劃路徑", type="primary")
     
     st.divider()
-    st.write("🔴 紅色點：發生 5 次以上")
-    st.write("🟠 橘色點：發生 2~4 次")
-    st.write("🟢 綠色點：發生 1 次")
+    st.caption(f"目前有效路口資料數: {len(df_accidents)} 筆")
 
-# --- 4. 地圖邏輯核心 ---
-def get_coordinates(address):
-    """使用 Nominatim (OpenStreetMap) 將地址轉為經緯度"""
-    geolocator = Nominatim(user_agent="taichung_traffic_app")
-    try:
-        # 加上 "台中市" 增加準確度
-        loc = geolocator.geocode(f"台中市 {address}")
-        if loc:
-            return loc.latitude, loc.longitude
-        return None
-    except GeocoderTimedOut:
-        return None
-
-# 初始化地圖中心 (預設台中)
-m = folium.Map(location=[24.1477, 120.6733], zoom_start=13)
-
-# 標記所有車禍點 (預設顯示)
-for index, row in df_accidents.iterrows():
-    folium.CircleMarker(
-        location=[row['lat'], row['lon']],
-        radius=5 if row['color'] == 'green' else 8, # 危險的畫大一點
-        color=row['color'],
-        fill=True,
-        fill_color=row['color'],
-        fill_opacity=0.7,
-        popup=f"事故次數: {row['count']}\n等級: {row['risk']}"
-    ).add_to(m)
-
-# 當使用者按下查詢
-if run_btn and start_location and end_location:
-    with st.spinner('正在計算路徑並分析資料...'):
-        start_coords = get_coordinates(start_location)
-        end_coords = get_coordinates(end_location)
+# 按下按鈕後的邏輯
+if run_query and start_input and end_input:
+    with st.spinner('規劃路徑中...'):
+        s_coords = geocode_address(start_input)
+        e_coords = geocode_address(end_input)
         
-        if start_coords and end_coords:
-            # 1. 標記起點與終點
-            folium.Marker(start_coords, icon=folium.Icon(color='blue', icon='play'), tooltip="起點").add_to(m)
-            folium.Marker(end_coords, icon=folium.Icon(color='black', icon='stop'), tooltip="終點").add_to(m)
-            
-            # 2. 畫出直線路徑
-            folium.PolyLine(
-                locations=[start_coords, end_coords],
-                color="blue",
-                weight=2,
-                dash_array='5'
-            ).add_to(m)
-            
-            # 自動調整地圖視角以涵蓋路徑
-            m.fit_bounds([start_coords, end_coords])
-            
-            st.success(f"已規劃從 {start_location} 到 {end_location} 的路徑參考。")
-            
-            # 3. (進階) 篩選路徑附近的熱點
-            min_lat = min(start_coords[0], end_coords[0])
-            max_lat = max(start_coords[0], end_coords[0])
-            min_lon = min(start_coords[1], end_coords[1])
-            max_lon = max(start_coords[1], end_coords[1])
-            
-            nearby_accidents = df_accidents[
-                (df_accidents['lat'].between(min_lat-0.01, max_lat+0.01)) & 
-                (df_accidents['lon'].between(min_lon-0.01, max_lon+0.01))
-            ]
-            
-            if not nearby_accidents.empty:
-                high_risk_count = len(nearby_accidents[nearby_accidents['count'] >= 5])
-                st.warning(f"⚠️ 路徑周邊範圍內共有 {len(nearby_accidents)} 個事故點，其中包含 {high_risk_count} 個高風險(紅色)熱點，請小心駕駛！")
-            
-        else:
-            st.error("找不到地點，請嘗試輸入更完整的名稱 (例如：台中火車站、逢甲大學)。")
+        if s_coords and e_coords:
+            path, dist, dur = get_osrm_route(s_coords, e_coords)
+            if path:
+                # 這裡是用 shapely 來算哪些點在路徑附近
+                if SHAPELY_AVAILABLE:
+                    line = LineString([(p[1], p[0]) for p in path])
+                    def is_near(row):
+                        deg = line.distance(Point(row['lon'], row['lat']))
+                        lat_m, lon_m = meters_per_degree(row['lat'])
+                        # 算出距離有沒有小於 buffer_input
+                        return (deg * math.hypot(lat_m, lon_m)) <= buffer_input
+                    mask = df_accidents.apply(is_near, axis=1)
+                else:
+                    # 沒裝 shapely 就全部顯示，避免當掉
+                    mask = [True] * len(df_accidents)
 
-# --- 5. 渲染地圖 ---
-st_folium(m, width=1200, height=600)
+                # 把結果存起來
+                st.session_state.app_state.update({
+                    'has_result': True, 'nearby_df': df_accidents[mask].copy(),
+                    'start_coords': s_coords, 'end_coords': e_coords,
+                    'route_path': path, 'route_dist': dist, 'route_time': dur,
+                    'start_name': start_input, 'end_name': end_input,
+                    'buffer': buffer_input, 'center': s_coords
+                })
+            else: st.error("路徑規劃失敗")
+        else: st.error("找不到起終點")
 
-# --- 6. 數據統計圖表 ---
+# 畫地圖的部分
+state = st.session_state.app_state
+m = folium.Map(location=state['center'], zoom_start=state['zoom'])
+# 選個乾淨的底圖
+folium.TileLayer('CartoDB positron', name='簡潔底圖').add_to(m)
+
+# 把所有事故點都畫出來，預設打開
+all_group = folium.FeatureGroup(name='⚠️ 所有事故路口 (點擊開啟)', show=False)
+for _, row in df_accidents.iterrows():
+    folium.CircleMarker(
+        [row['lat'], row['lon']], radius=4, color=row['color'], 
+        fill=True, fill_opacity=0.6, popup=row['risk']
+    ).add_to(all_group)
+all_group.add_to(m)
+
+# 如果有搜尋結果，就畫出路徑跟附近的熱點
+if state['has_result']:
+    folium.PolyLine(state['route_path'], color="blue", weight=5, opacity=0.7).add_to(m)
+    folium.Marker(state['start_coords'], icon=folium.Icon(color='green', icon='play'), tooltip="起點").add_to(m)
+    folium.Marker(state['end_coords'], icon=folium.Icon(color='red', icon='stop'), tooltip="終點").add_to(m)
+    
+    res_group = folium.FeatureGroup(name='路徑沿線熱點', show=True)
+    for _, row in state['nearby_df'].iterrows():
+        folium.CircleMarker(
+            [row['lat'], row['lon']], radius=7, color=row['color'],
+            fill=True, fill_opacity=0.9, popup=row['risk']
+        ).add_to(res_group)
+    res_group.add_to(m)
+    
+    st.success(f"規劃完成：{state['start_name']} ➝ {state['end_name']}")
+    st.info(f"路徑周邊發現 {len(state['nearby_df'])} 個事故點")
+
+folium.LayerControl().add_to(m)
+st_folium(m, width=1200, height=650, returned_objects=[])
+
+# 下載按鈕
 st.divider()
-st.subheader("📊 台中市事故數據分析")
-col1, col2 = st.columns(2)
-
-with col1:
-    st.write("各等級事故比例")
-    st.bar_chart(df_accidents['risk'].value_counts())
-
-with col2:
-    st.write("數據概覽")
-    st.dataframe(df_accidents.head())
+if state['has_result'] and state['nearby_df'] is not None:
+    st.subheader("📥 下載分析報告")
+    csv = state['nearby_df'].to_csv(index=False).encode('utf-8-sig')
+    st.download_button("下載沿線事故資料 CSV", csv, "route_accidents.csv", "text/csv", type="primary")
