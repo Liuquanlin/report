@@ -5,3 +5,5 @@ streamlit-folium
 geopy
 requests
 polyline
+shapely
+branca
